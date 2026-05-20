@@ -292,6 +292,56 @@ def build_best_index_image(geom, start, end, index):
     )
 
     return index_img
+
+
+def build_best_base_image(geom, start, end):
+    """
+    Tạo ảnh nền đã mask và chuẩn hóa band.
+    Ưu tiên Sentinel-2 10m, nếu không có ảnh phù hợp thì fallback Landsat 8/9.
+    Trả về ee.Image có property: image_count, source, native_scale.
+    """
+    s2 = sentinel2_collection(geom, start, end, cloud=75)
+    s2_count = s2.size()
+
+    def use_sentinel():
+        return s2.median().clip(geom).set({
+            "image_count": s2_count,
+            "source": "Google Earth Engine - Sentinel-2 SR Harmonized 10m",
+            "native_scale": 10
+        })
+
+    def use_landsat():
+        ls = landsat_collection(geom, start, end, cloud=55)
+        ls_count = ls.size()
+        return ls.median().clip(geom).set({
+            "image_count": ls_count,
+            "source": "Google Earth Engine - Landsat 8/9 Collection 2 Level 2",
+            "native_scale": 30
+        })
+
+    return ee.Image(
+        ee.Algorithms.If(
+            s2_count.gt(0),
+            use_sentinel(),
+            use_landsat()
+        )
+    )
+
+
+def get_period_dates(year, month):
+    start = ee.Date.fromYMD(int(year), int(month), 1)
+    end = start.advance(1, "month")
+    return start, end
+
+
+def get_native_scale(img, default=30):
+    try:
+        scale = img.get("native_scale").getInfo()
+        if scale:
+            return int(scale)
+    except Exception:
+        pass
+    return default
 def safe_reduce(img, roi, index, scale=250):
     stat = img.reduceRegion(
         reducer=ee.Reducer.mean()
@@ -592,85 +642,95 @@ def map_tile():
 # STATS
 # ============================================
 
+
 @app.route("/stats")
+@json_cache(ttl=60 * 30)
 def stats():
-    index=request.args.get("index")
-    country=request.args.get("country")
-    province=request.args.get("province")
-    year=request.args.get("year")
-    month=request.args.get("month")
-    provinces=[p.strip() for p in province.split(",")]
-    roi=admin1.filter(
-        ee.Filter.And(
-            ee.Filter.eq("ADM0_NAME",country),
-            ee.Filter.inList("ADM1_NAME",provinces)
-        )
-    ).geometry()
-    start=f"{year}-{month}-01"
-    end=ee.Date(start).advance(1,"month")
-    col=ee.ImageCollection("LANDSAT/LC08/C02/T1_L2").merge(
-        ee.ImageCollection("LANDSAT/LC09/C02/T1_L2")
-    ).filterBounds(roi).filterDate(start,end).map(maskLandsat)
-    
-    image = col.median()
-    img=calc_index(image,index).clip(roi)
-    stats = img.reduceRegion(
-        reducer=ee.Reducer.mean().combine(
-            reducer2=ee.Reducer.minMax(), sharedInputs=True
-        ).combine(
-            reducer2=ee.Reducer.stdDev(), sharedInputs=True
-        ),
-        geometry=roi,
-        scale=100,
-        bestEffort=True
-    ).getInfo()
-    
-    return jsonify({
-        "mean":stats.get(index+"_mean"),
-        "min":stats.get(index+"_min"),
-        "max":stats.get(index+"_max"),
-        "stdDev":stats.get(index+"_stdDev")
-    })
+    try:
+        index = request.args.get("index")
+        country = request.args.get("country")
+        province = request.args.get("province")
+        year = int(request.args.get("year"))
+        month = int(request.args.get("month"))
+
+        roi = get_roi(country, province).geometry()
+        start, end = get_period_dates(year, month)
+
+        img = build_best_index_image(roi, start, end, index)
+        count = img.get("image_count").getInfo()
+        source = img.get("source").getInfo()
+
+        if count is None or int(count) == 0:
+            return jsonify({
+                "mean": None,
+                "min": None,
+                "max": None,
+                "stdDev": None,
+                "image_count": 0,
+                "source": source or "Google Earth Engine",
+                "message": "Không có ảnh Sentinel-2 hoặc Landsat phù hợp."
+            })
+
+        stats_json = safe_reduce(img, roi, index, scale=30)
+        stats_json.update({
+            "image_count": int(count),
+            "source": source,
+            "resolution_note": "Thống kê dùng cùng ảnh với bản đồ: Sentinel-2 ưu tiên, Landsat fallback."
+        })
+        return jsonify(stats_json)
+
+    except Exception as e:
+        return jsonify({"error": "stats failed", "detail": str(e)}), 500
 
 # ============================================
 # TIME SERIES
 # ============================================
 
-@app.route("/timeseries")
-def timeseries():
-    country=request.args.get("country")
-    province=request.args.get("province")
-    index=request.args.get("index")
-    provinces=[p.strip() for p in province.split(",")]
-    roi=admin1.filter(
-        ee.Filter.And(
-            ee.Filter.eq("ADM0_NAME",country),
-            ee.Filter.inList("ADM1_NAME",provinces)
-        )
-    ).geometry()
-    years=list(range(2021,2027))
-    result=[]
-    for y in years:
-        col=ee.ImageCollection("LANDSAT/LC08/C02/T1_L2").merge(
-            ee.ImageCollection("LANDSAT/LC09/C02/T1_L2")
-        ).filterBounds(roi).filterDate(f"{y}-01-01",f"{y}-12-31").map(maskLandsat)
-        
-        if col.size().getInfo() == 0:
-            result.append({"year":y,"value":0})
-            continue
-        
-        image=col.median()
-        img = calc_index(image,index).clip(roi)
-        stat=img.reduceRegion(
-            reducer=ee.Reducer.mean(),
-            geometry=roi,
-            scale=100,
-            bestEffort=True
-        ).getInfo()
-        band=list(stat.keys())[0]
-        result.append({"year":y,"value":stat.get(band)})
 
-    return jsonify(result)
+@app.route("/timeseries")
+@json_cache(ttl=60 * 60)
+def timeseries():
+    try:
+        country = request.args.get("country")
+        province = request.args.get("province")
+        index = request.args.get("index")
+
+        roi = get_roi(country, province).geometry()
+        current_year = datetime.now().year
+        years = list(range(max(2016, current_year - 7), current_year + 1))
+        result = []
+
+        for y in years:
+            y_start = ee.Date.fromYMD(y, 1, 1)
+            y_end = y_start.advance(1, "year")
+            img = build_best_index_image(roi, y_start, y_end, index)
+            count = img.get("image_count").getInfo()
+            source = img.get("source").getInfo()
+
+            if count is None or int(count) == 0:
+                result.append({"year": y, "value": None, "image_count": 0, "source": source})
+                continue
+
+            stat = img.reduceRegion(
+                reducer=ee.Reducer.mean(),
+                geometry=roi,
+                scale=250,
+                bestEffort=True,
+                maxPixels=1e10,
+                tileScale=4
+            ).getInfo()
+
+            result.append({
+                "year": y,
+                "value": stat.get(index),
+                "image_count": int(count),
+                "source": source
+            })
+
+        return jsonify(result)
+
+    except Exception as e:
+        return jsonify({"error": "timeseries failed", "detail": str(e)}), 500
 
 @app.route("/zoom_province")
 def zoom_province():
@@ -690,233 +750,292 @@ def zoom_province():
 # CORRELATION
 # ============================================
 
+
 @app.route("/correlation")
+@json_cache(ttl=60 * 30)
 def correlation():
-    country = request.args.get("country")
-    province = request.args.get("province")
-    year = request.args.get("year")
-    month = request.args.get("month")
-    provinces = [p.strip() for p in province.split(",")]
+    try:
+        country = request.args.get("country")
+        province = request.args.get("province")
+        year = int(request.args.get("year"))
+        month = int(request.args.get("month"))
 
-    roi = admin1.filter(
-        ee.Filter.And(
-            ee.Filter.eq("ADM0_NAME", country),
-            ee.Filter.inList("ADM1_NAME", provinces)
-        )
-    ).geometry()
-    
-    start = f"{year}-{month}-01"
-    end = ee.Date(start).advance(1, "month")
-    col = ee.ImageCollection("LANDSAT/LC08/C02/T1_L2").merge(
-        ee.ImageCollection("LANDSAT/LC09/C02/T1_L2")
-    ).filterBounds(roi).filterDate(start, end).map(maskLandsat)
-    
-    image = col.median()
-    ndvi = calc_index(image, "NDVI")
-    ndwi = calc_index(image, "NDWI")
-    evi  = calc_index(image, "EVI")
-    nbr  = calc_index(image, "NBR")
-    
-    stack = ndvi.addBands([ndwi, evi, nbr]).rename(["NDVI", "NDWI", "EVI", "NBR"])
+        roi = get_roi(country, province).geometry()
+        start, end = get_period_dates(year, month)
 
-    samples = stack.sample(
-        region=roi,
-        scale=100,
-        numPixels=500,
-        geometries=False
-    )
-    
-    data = samples.getInfo()["features"]
-    ndvi_vals = []
-    ndwi_vals = []
-    evi_vals  = []
-    nbr_vals  = []
-    
-    for f in data:
-        props = f["properties"]
-        if all(k in props for k in ["NDVI","NDWI","EVI","NBR"]):
-            ndvi_vals.append(props["NDVI"])
-            ndwi_vals.append(props["NDWI"])
-            evi_vals.append(props["EVI"])
-            nbr_vals.append(props["NBR"])
-    
-    def corr(a,b):
-        if len(a) == 0:
-            return 0
-        return float(np.corrcoef(a,b)[0,1])
-    
-    return jsonify({
-        "ndvi_ndwi": corr(ndvi_vals, ndwi_vals),
-        "ndvi_evi": corr(ndvi_vals, evi_vals),
-        "ndvi_nbr": corr(ndvi_vals, nbr_vals)
-    })
+        base_image = build_best_base_image(roi, start, end)
+        count = base_image.get("image_count").getInfo()
+        source = base_image.get("source").getInfo()
+
+        if count is None or int(count) == 0:
+            return jsonify({
+                "ndvi_ndwi": 0,
+                "ndvi_evi": 0,
+                "ndvi_nbr": 0,
+                "image_count": 0,
+                "source": source or "Google Earth Engine"
+            })
+
+        ndvi = calc_index(base_image, "NDVI")
+        ndwi = calc_index(base_image, "NDWI")
+        evi = calc_index(base_image, "EVI")
+        nbr = calc_index(base_image, "NBR")
+
+        stack = ndvi.addBands([ndwi, evi, nbr]).rename(["NDVI", "NDWI", "EVI", "NBR"])
+        samples = stack.sample(
+            region=roi,
+            scale=60,
+            numPixels=400,
+            geometries=False,
+            tileScale=4
+        ).getInfo()
+
+        ndvi_vals, ndwi_vals, evi_vals, nbr_vals = [], [], [], []
+        for f in samples.get("features", []):
+            props = f.get("properties", {})
+            if all(k in props and props[k] is not None for k in ["NDVI", "NDWI", "EVI", "NBR"]):
+                ndvi_vals.append(props["NDVI"])
+                ndwi_vals.append(props["NDWI"])
+                evi_vals.append(props["EVI"])
+                nbr_vals.append(props["NBR"])
+
+        def corr(a, b):
+            if len(a) < 3 or len(b) < 3:
+                return 0
+            value = float(np.corrcoef(a, b)[0, 1])
+            return 0 if np.isnan(value) else value
+
+        return jsonify({
+            "ndvi_ndwi": corr(ndvi_vals, ndwi_vals),
+            "ndvi_evi": corr(ndvi_vals, evi_vals),
+            "ndvi_nbr": corr(ndvi_vals, nbr_vals),
+            "sample_count": len(ndvi_vals),
+            "image_count": int(count),
+            "source": source
+        })
+
+    except Exception as e:
+        return jsonify({"error": "correlation failed", "detail": str(e)}), 500
 
 # ============================================
 # SCATTER DATA
 # ============================================
 
+
 @app.route("/scatter")
+@json_cache(ttl=60 * 30)
 def scatter():
-    country = request.args.get("country")
-    province = request.args.get("province")
-    year = request.args.get("year")
-    month = request.args.get("month")
-    provinces = [p.strip() for p in province.split(",")]
-    
-    roi = admin1.filter(
-        ee.Filter.And(
-            ee.Filter.eq("ADM0_NAME", country),
-            ee.Filter.inList("ADM1_NAME", provinces)
-        )
-    ).geometry()
-    
-    start = f"{year}-{month}-01"
-    end = ee.Date(start).advance(1, "month")
-    col = ee.ImageCollection("LANDSAT/LC08/C02/T1_L2").merge(
-        ee.ImageCollection("LANDSAT/LC09/C02/T1_L2")
-    ).filterBounds(roi).filterDate(start, end).map(maskLandsat)
-    
-    image = col.median()
-    ndvi = calc_index(image, "NDVI")
-    evi  = calc_index(image, "EVI")
-    stack = ndvi.addBands(evi).rename(["NDVI","EVI"])
-    samples = stack.sample(
-        region=roi,
-        scale=30,
-        numPixels=500,
-        geometries=False
-    ).getInfo()
-    
-    points = []
-    for f in samples["features"]:
-        p = f["properties"]
-        if "NDVI" in p and "EVI" in p:
-            points.append({"x": p["NDVI"], "y": p["EVI"]})
-    
-    return jsonify(points)
+    try:
+        country = request.args.get("country")
+        province = request.args.get("province")
+        year = int(request.args.get("year"))
+        month = int(request.args.get("month"))
+
+        roi = get_roi(country, province).geometry()
+        start, end = get_period_dates(year, month)
+
+        base_image = build_best_base_image(roi, start, end)
+        count = base_image.get("image_count").getInfo()
+
+        if count is None or int(count) == 0:
+            return jsonify([])
+
+        ndvi = calc_index(base_image, "NDVI")
+        evi = calc_index(base_image, "EVI")
+        stack = ndvi.addBands(evi).rename(["NDVI", "EVI"])
+
+        samples = stack.sample(
+            region=roi,
+            scale=60,
+            numPixels=350,
+            geometries=False,
+            tileScale=4
+        ).getInfo()
+
+        points = []
+        for f in samples.get("features", []):
+            props = f.get("properties", {})
+            if props.get("NDVI") is not None and props.get("EVI") is not None:
+                points.append({"x": props["NDVI"], "y": props["EVI"]})
+
+        return jsonify(points)
+
+    except Exception as e:
+        return jsonify({"error": "scatter failed", "detail": str(e)}), 500
 
 # ============================================
 # PIXEL VALUE
 # ============================================
 
+
 @app.route("/pixel")
+@json_cache(ttl=60 * 10)
 def pixel():
-    lat=float(request.args.get("lat"))
-    lon=float(request.args.get("lon"))
-    year=request.args.get("year")
-    month=request.args.get("month")
-    index=request.args.get("index")
-    point=ee.Geometry.Point([lon,lat])
-    start=f"{year}-{month}-01"
-    end=ee.Date(start).advance(1,"month")
-    col=ee.ImageCollection("LANDSAT/LC08/C02/T1_L2").merge(
-        ee.ImageCollection("LANDSAT/LC09/C02/T1_L2")
-    ).filterBounds(point).filterDate(start,end).map(maskLandsat)
-    
-    image = col.median()
-    img=calc_index(image,index)
-    val=img.reduceRegion(
-        reducer=ee.Reducer.first(),
-        geometry=point,
-        scale=30
-    ).getInfo()
-    
-    if val is None:
-        return jsonify({})
-    return jsonify(val)
+    try:
+        lat = float(request.args.get("lat"))
+        lon = float(request.args.get("lon"))
+        year = int(request.args.get("year"))
+        month = int(request.args.get("month"))
+        index = request.args.get("index")
+
+        point = ee.Geometry.Point([lon, lat])
+        geom = point.buffer(1500)
+        start, end = get_period_dates(year, month)
+
+        img = build_best_index_image(geom, start, end, index)
+        count = img.get("image_count").getInfo()
+        source = img.get("source").getInfo()
+
+        if count is None or int(count) == 0:
+            return jsonify({"value": None, "image_count": 0, "source": source or "Google Earth Engine"})
+
+        val = img.reduceRegion(
+            reducer=ee.Reducer.first(),
+            geometry=point,
+            scale=20,
+            bestEffort=True,
+            maxPixels=1e8,
+            tileScale=4
+        ).getInfo()
+
+        return jsonify({
+            "value": val.get(index),
+            "raw": val,
+            "image_count": int(count),
+            "source": source
+        })
+
+    except Exception as e:
+        return jsonify({"error": "pixel failed", "detail": str(e)}), 500
 
 # ============================================
 # EXPORT GEOTIFF
 # ============================================
 
+
 @app.route("/export")
 def export():
-    index=request.args.get("index")
-    country=request.args.get("country")
-    province=request.args.get("province")
-    year=int(request.args.get("year"))
-    month=int(request.args.get("month"))
-    provinces=[p.strip() for p in province.split(",")]
-    region=admin1.filter(
-        ee.Filter.And(
-            ee.Filter.eq("ADM0_NAME",country),
-            ee.Filter.inList("ADM1_NAME",provinces)
-        )
-    )
-    geom=region.geometry()
-    start=ee.Date.fromYMD(year,month,1)
-    end=start.advance(1,"month")
+    try:
+        index = request.args.get("index")
+        country = request.args.get("country")
+        province = request.args.get("province")
+        year = int(request.args.get("year"))
+        month = int(request.args.get("month"))
 
-    col=ee.ImageCollection("LANDSAT/LC08/C02/T1_L2").merge(
-        ee.ImageCollection("LANDSAT/LC09/C02/T1_L2")
-    ).filterBounds(geom).filterDate(start,end).map(maskLandsat)
+        region = get_roi(country, province)
+        geom = region.geometry()
+        start, end = get_period_dates(year, month)
 
-    image=col.median()
-    img=calc_index(image,index).clip(geom)
-    url=img.getDownloadURL({
-        "scale":30,
-        "region":geom,
-        "format":"GEO_TIFF"
-    })
-    return jsonify({"url":url})
+        img = build_best_index_image(geom, start, end, index)
+        count = img.get("image_count").getInfo()
+        source = img.get("source").getInfo()
+
+        if count is None or int(count) == 0:
+            return jsonify({
+                "url": None,
+                "error": "Không có ảnh phù hợp để xuất GeoTIFF.",
+                "image_count": 0,
+                "source": source or "Google Earth Engine"
+            }), 404
+
+        url = img.getDownloadURL({
+            "scale": 30,
+            "region": geom,
+            "format": "GEO_TIFF"
+        })
+
+        return jsonify({"url": url, "image_count": int(count), "source": source})
+
+    except Exception as e:
+        return jsonify({"error": "export failed", "detail": str(e)}), 500
+
 
 @app.route("/images")
+@json_cache(ttl=60 * 30)
 def get_images():
-    year=int(request.args.get("year"))
-    month=int(request.args.get("month"))
-    country=request.args.get("country")
-    province=request.args.get("province")
-    provinces=[p.strip() for p in province.split(",")]
-    region=admin1.filter(
-        ee.Filter.And(
-            ee.Filter.eq("ADM0_NAME",country),
-            ee.Filter.inList("ADM1_NAME",provinces)
-        )
-    )
-    geom=region.geometry()
-    start=ee.Date.fromYMD(year,month,1)
-    end=start.advance(1,"month")
-    col=ee.ImageCollection("LANDSAT/LC08/C02/T1_L2").merge(
-        ee.ImageCollection("LANDSAT/LC09/C02/T1_L2")
-    ).filterBounds(geom).filterDate(start,end).filter(ee.Filter.lt("CLOUD_COVER",30))
-    
-    ids = col.aggregate_array("LANDSAT_PRODUCT_ID").getInfo() or []
-    return jsonify(ids)
+    try:
+        year = int(request.args.get("year"))
+        month = int(request.args.get("month"))
+        country = request.args.get("country")
+        province = request.args.get("province")
+
+        region = get_roi(country, province)
+        geom = region.geometry()
+        start, end = get_period_dates(year, month)
+
+        s2 = sentinel2_collection(geom, start, end, cloud=75)
+        s2_count = s2.size().getInfo()
+
+        if s2_count and int(s2_count) > 0:
+            ids = s2.aggregate_array("system:index").getInfo() or []
+            return jsonify({
+                "source": "Sentinel-2 SR Harmonized",
+                "image_count": int(s2_count),
+                "ids": ids[:80]
+            })
+
+        ls = landsat_collection(geom, start, end, cloud=55)
+        ls_count = ls.size().getInfo()
+        ids = ls.aggregate_array("LANDSAT_PRODUCT_ID").getInfo() or []
+
+        return jsonify({
+            "source": "Landsat 8/9 Collection 2 Level 2",
+            "image_count": int(ls_count or 0),
+            "ids": ids[:80]
+        })
+
+    except Exception as e:
+        return jsonify({"error": "images failed", "detail": str(e)}), 500
 
 # ============================================
 # DIFFERENCE ANALYSIS
 # ============================================
 
+
 @app.route("/difference")
+@json_cache(ttl=60 * 30)
 def difference():
-    index = request.args.get("index")
-    country = request.args.get("country")
-    province = request.args.get("province")
-    
-    y1, m1 = int(request.args.get("y1")), int(request.args.get("m1"))
-    y2, m2 = int(request.args.get("y2")), int(request.args.get("m2"))
-    
-    provinces = [p.strip() for p in province.split(",")]
-    roi = admin1.filter(ee.Filter.And(
-        ee.Filter.eq("ADM0_NAME", country),
-        ee.Filter.inList("ADM1_NAME", provinces)
-    )).geometry()
+    try:
+        index = request.args.get("index")
+        country = request.args.get("country")
+        province = request.args.get("province")
 
-    def get_img(y, m):
-        start = ee.Date.fromYMD(y, m, 1)
-        col = ee.ImageCollection("LANDSAT/LC08/C02/T1_L2").merge(
-            ee.ImageCollection("LANDSAT/LC09/C02/T1_L2")
-        ).filterBounds(roi).filterDate(start, start.advance(1, "month")).map(maskLandsat)
-        return calc_index(col.median(), index)
+        y1, m1 = int(request.args.get("y1")), int(request.args.get("m1"))
+        y2, m2 = int(request.args.get("y2")), int(request.args.get("m2"))
 
-    img1 = get_img(y1, m1)
-    img2 = get_img(y2, m2)
-    
-    diff = img2.subtract(img1).clip(roi)
-    vis = {"min": -0.5, "max": 0.5, "palette": ["red", "white", "blue"]}
-    mapid = diff.getMapId(vis)
-    
-    return jsonify({"tile": mapid["tile_fetcher"].url_format})
+        roi = get_roi(country, province).geometry()
+
+        s1, e1 = get_period_dates(y1, m1)
+        s2, e2 = get_period_dates(y2, m2)
+
+        img1 = build_best_index_image(roi, s1, e1, index)
+        img2 = build_best_index_image(roi, s2, e2, index)
+
+        count1 = img1.get("image_count").getInfo()
+        count2 = img2.get("image_count").getInfo()
+
+        if count1 is None or int(count1) == 0 or count2 is None or int(count2) == 0:
+            return jsonify({
+                "tile": None,
+                "error": "Không đủ ảnh vệ tinh cho một trong hai kỳ so sánh.",
+                "count_period_1": int(count1 or 0),
+                "count_period_2": int(count2 or 0)
+            }), 404
+
+        diff = img2.subtract(img1).rename(index + "_delta").clip(roi)
+        vis = {"min": -0.35, "max": 0.35, "palette": ["#b91c1c", "#fef3c7", "#ffffff", "#bbf7d0", "#15803d"]}
+        mapid = diff.getMapId(vis)
+
+        return jsonify({
+            "tile": mapid["tile_fetcher"].url_format,
+            "count_period_1": int(count1),
+            "count_period_2": int(count2),
+            "source_period_1": img1.get("source").getInfo(),
+            "source_period_2": img2.get("source").getInfo()
+        })
+
+    except Exception as e:
+        return jsonify({"error": "difference failed", "detail": str(e)}), 500
 
 # ============================================
 # ENHANCED WEATHER FORECAST - 7 DAYS
@@ -1038,12 +1157,12 @@ def analysis_bundle():
 
         count = int(count)
 
-        # Sentinel-2 mịn hơn, nhưng reduce scale 100 để nhẹ và ổn định
+        # Sentinel-2 mịn hơn; scale 60 cân bằng giữa độ nét và tốc độ trên Render Free
         stats_json = safe_reduce(
             img=img,
             roi=roi,
             index=index,
-            scale=100
+            scale=60
         )
 
         # =====================================================
@@ -1129,8 +1248,8 @@ def analysis_bundle():
 
             sample = stack.sample(
                 region=roi,
-                scale=100,
-                numPixels=200,
+                scale=60,
+                numPixels=250,
                 geometries=False,
                 tileScale=4
             ).getInfo()
@@ -1269,6 +1388,7 @@ def analysis_bundle():
 # NDVI / NDWI CHANGE MONITORING
 # ============================================
 
+
 @app.route("/change_monitor")
 @json_cache(ttl=60 * 30)
 def change_monitor():
@@ -1285,46 +1405,40 @@ def change_monitor():
         if index not in ["NDVI", "NDWI", "EVI", "NDMI", "NBR", "SAVI"]:
             return jsonify({"error": "Index không hợp lệ"}), 400
 
-        region = get_roi(country, province)
-        roi = region.geometry()
+        roi = get_roi(country, province).geometry()
+        s1, e1 = get_period_dates(y1, m1)
+        s2, e2 = get_period_dates(y2, m2)
 
-        def build_index_image(year, month):
-            start = ee.Date.fromYMD(year, month, 1)
-            end = start.advance(1, "month")
-            col = landsat_collection(roi, start, end, cloud=45)
+        img1 = build_best_index_image(roi, s1, e1, index)
+        img2 = build_best_index_image(roi, s2, e2, index)
 
-            count = col.size().getInfo()
-            if count == 0:
-                return None, count
+        count1 = img1.get("image_count").getInfo()
+        count2 = img2.get("image_count").getInfo()
+        source1 = img1.get("source").getInfo()
+        source2 = img2.get("source").getInfo()
 
-            image = col.median()
-            idx = calc_index(image, index).clip(roi)
-            return idx, count
-
-        img1, count1 = build_index_image(y1, m1)
-        img2, count2 = build_index_image(y2, m2)
-
-        if img1 is None or img2 is None:
+        if count1 is None or int(count1) == 0 or count2 is None or int(count2) == 0:
             return jsonify({
                 "error": "Không đủ ảnh vệ tinh cho một trong hai kỳ so sánh.",
-                "count_period_1": count1,
-                "count_period_2": count2
+                "count_period_1": int(count1 or 0),
+                "count_period_2": int(count2 or 0),
+                "source_period_1": source1,
+                "source_period_2": source2
             }), 404
 
         diff = img2.subtract(img1).rename(index + "_delta").clip(roi)
+        band = index + "_delta"
 
         stat = diff.reduceRegion(
             reducer=ee.Reducer.mean()
             .combine(reducer2=ee.Reducer.minMax(), sharedInputs=True)
             .combine(reducer2=ee.Reducer.stdDev(), sharedInputs=True),
             geometry=roi,
-            scale=250,
+            scale=60,
             bestEffort=True,
             maxPixels=1e10,
             tileScale=4
         ).getInfo()
-
-        band = index + "_delta"
 
         mean_delta = stat.get(band + "_mean")
         min_delta = stat.get(band + "_min")
@@ -1336,7 +1450,6 @@ def change_monitor():
             "max": 0.35,
             "palette": ["#b91c1c", "#fef3c7", "#ffffff", "#bbf7d0", "#15803d"]
         }
-
         mapid = diff.getMapId(vis)
 
         status = "biến động ổn định"
@@ -1356,18 +1469,12 @@ def change_monitor():
                 status = "tăng nhẹ"
                 risk = "thấp"
 
-        if index == "NDWI":
-            subject = "mặt nước/độ ẩm bề mặt"
-        elif index == "NDVI":
-            subject = "thảm thực vật"
-        else:
-            subject = "chỉ số vệ tinh"
-
+        subject = "mặt nước/độ ẩm bề mặt" if index == "NDWI" else "thảm thực vật" if index == "NDVI" else "chỉ số vệ tinh"
         ai_summary = (
             f"AI Change Monitoring đánh giá {subject} có trạng thái {status}. "
             f"Giá trị biến động trung bình {round(mean_delta, 4) if mean_delta is not None else 'N/A'}. "
             f"Mức rủi ro: {risk}. "
-            f"Kết quả tính trực tiếp từ ảnh Landsat 8/9 trên Google Earth Engine."
+            f"Kết quả tính từ cùng pipeline ảnh của bản đồ: Sentinel-2 ưu tiên, Landsat fallback."
         )
 
         return jsonify({
@@ -1376,8 +1483,8 @@ def change_monitor():
             "period_1": f"{y1}-{m1:02d}",
             "period_2": f"{y2}-{m2:02d}",
             "image_count": {
-                "period_1": count1,
-                "period_2": count2
+                "period_1": int(count1),
+                "period_2": int(count2)
             },
             "stats": {
                 "mean_delta": mean_delta,
@@ -1397,15 +1504,16 @@ def change_monitor():
                     {"label": "Tăng/phục hồi", "color": "#15803d", "value": 0.35}
                 ]
             },
-            "source": "Google Earth Engine - Landsat 8/9 Collection 2 Level 2",
+            "source": {
+                "period_1": source1,
+                "period_2": source2
+            },
             "generated_at": datetime.now(timezone.utc).isoformat()
         })
 
     except Exception as e:
-        return jsonify({
-            "error": "change monitor failed",
-            "detail": str(e)
-        }), 500
+        return jsonify({"error": "change monitor failed", "detail": str(e)}), 500
+
     # ============================================
 # AI ARIMA NDVI / NDWI FORECAST - LOCAL CSV
 # ============================================
