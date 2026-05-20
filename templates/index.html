@@ -1,0 +1,551 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>GreenWater Enterprise WebGIS - AI Weather Analytics</title>
+    
+    <!-- ✅ PHẢI CÓ CSS OpenLayers -->
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/ol@10.0.0/ol.css">
+    
+    <!-- ✅ Chart.js -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.js"></script>
+
+    <!-- Bootstrap Icons (optional) -->
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.0/font/bootstrap-icons.css">
+
+    <!-- Enhanced Styles -->
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        /* ✅ FIX: Set height cho html & body */
+        html, body {
+            width: 100%;
+            height: 100%;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: #0f172a;
+            color: #e2e8f0;
+        }
+
+        .container {
+            display: grid;
+            grid-template-columns: 350px 1fr 300px;
+            height: 100vh;
+            gap: 0;
+        }
+
+        .sidebar {
+            background: linear-gradient(135deg, #1e293b, #0f172a);
+            border-right: 1px solid #334155;
+            overflow-y: auto;
+            padding: 20px;
+        }
+
+        .sidebar h2 {
+            font-size: 18px;
+            margin-bottom: 20px;
+            color: #3b82f6;
+            font-weight: 600;
+        }
+
+        .form-group {
+            margin-bottom: 15px;
+        }
+
+        .form-group label {
+            display: block;
+            font-size: 13px;
+            color: #94a3b8;
+            margin-bottom: 6px;
+            font-weight: 500;
+        }
+
+        .form-group select {
+            width: 100%;
+        }
+
+        .btn-container {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 10px;
+            margin-top: 20px;
+        }
+
+        .btn-container button {
+            padding: 10px;
+            font-size: 13px;
+        }
+
+.map-wrapper {
+    width: 100%;
+    height: 100%;
+    position: relative;
+    background: #000;
+    overflow: hidden;
+}
+
+.map {
+    width: 100%;
+    height: 100%;
+    background: #000;
+    position: relative;
+    z-index: 1;
+}
+
+.map-toggle-btn {
+    position: absolute;
+    top: 18px;
+    left: 18px;
+    z-index: 20;
+    padding: 10px 14px;
+    border-radius: 12px;
+    border: 1px solid rgba(59, 130, 246, 0.45);
+    background: rgba(15, 23, 42, 0.88);
+    color: #e2e8f0;
+    cursor: pointer;
+    font-weight: 600;
+    box-shadow: 0 12px 28px rgba(0,0,0,0.28);
+    backdrop-filter: blur(12px);
+}
+
+.map-toggle-btn:hover {
+    background: rgba(59, 130, 246, 0.25);
+}
+
+        .right-panel {
+            background: linear-gradient(135deg, #1e293b, #0f172a);
+            border-left: 1px solid #334155;
+            overflow-y: auto;
+            padding: 20px;
+            display: flex;
+            flex-direction: column;
+            gap: 20px;
+        }
+
+        .panel-section {
+            background: rgba(30, 41, 59, 0.6);
+            border: 1px solid #334155;
+            border-radius: 12px;
+            padding: 15px;
+        }
+
+        .panel-section h3 {
+            font-size: 14px;
+            font-weight: 600;
+            color: #3b82f6;
+            margin-bottom: 12px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        #legend {
+            font-size: 13px;
+        }
+
+        #stats {
+            font-size: 13px;
+            line-height: 1.6;
+        }
+
+        #stats div {
+            padding: 4px 0;
+        }
+
+        #layerControl {
+            font-size: 13px;
+        }
+
+        .layer-control-title {
+            font-weight: 600;
+            color: #3b82f6;
+            margin-bottom: 10px;
+        }
+
+        /* ✅ FIX: Main content phải absolute, không fixed */
+        .main-content {
+            display: flex;
+            flex-direction: column;
+            height: 100%;
+            overflow-y: auto;
+            padding: 20px;
+            position: absolute;
+            top: 0;
+            left: 350px;
+            right: 300px;
+            bottom: 0;
+            z-index: 2;
+            pointer-events: auto;
+            background: rgba(15, 23, 42, 0.85);
+        }
+
+        .tabs {
+            display: flex;
+            gap: 0;
+            border-bottom: 2px solid #334155;
+            margin-bottom: 20px;
+        }
+
+        .tab-btn {
+            padding: 12px 16px;
+            background: transparent;
+            color: #94a3b8;
+            border: none;
+            cursor: pointer;
+            font-weight: 500;
+            position: relative;
+            transition: color 0.3s ease;
+        }
+
+        .tab-btn.active {
+            color: #3b82f6;
+        }
+
+        .tab-btn.active::after {
+            content: '';
+            position: absolute;
+            bottom: -2px;
+            left: 0;
+            right: 0;
+            height: 2px;
+            background: #3b82f6;
+        }
+
+        .tab-btn:hover {
+            color: #e2e8f0;
+        }
+
+        .tab-content {
+            display: none;
+        }
+
+        .tab-content.active {
+            display: block;
+            animation: fadeIn 0.3s ease;
+        }
+
+        @keyframes fadeIn {
+            from { opacity: 0; }
+            to { opacity: 1; }
+        }
+
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 10px;
+            margin-top: 10px;
+        }
+
+        .stat-item {
+            background: rgba(59, 130, 246, 0.1);
+            padding: 10px;
+            border-radius: 8px;
+            border-left: 3px solid #3b82f6;
+        }
+
+        .stat-label {
+            font-size: 11px;
+            color: #94a3b8;
+            text-transform: uppercase;
+        }
+
+        .stat-value {
+            font-size: 16px;
+            font-weight: bold;
+            color: #3b82f6;
+            margin-top: 4px;
+        }
+
+        @media (max-width: 1200px) {
+            .container {
+                grid-template-columns: 1fr;
+            }
+
+            .sidebar, .right-panel {
+                display: none;
+            }
+
+            .main-content {
+                left: 0;
+                right: 0;
+                background: rgba(15, 23, 42, 1);
+            }
+        }
+
+        .data-table {
+            width: 100%;
+            font-size: 12px;
+            border-collapse: collapse;
+            margin-top: 10px;
+        }
+
+        .data-table th,
+        .data-table td {
+            padding: 8px;
+            text-align: left;
+            border-bottom: 1px solid #334155;
+        }
+
+        .data-table th {
+            background: rgba(59, 130, 246, 0.1);
+            color: #3b82f6;
+            font-weight: 600;
+        }
+
+        .data-table tr:hover {
+            background: rgba(59, 130, 246, 0.05);
+        }
+
+        #loading {
+            display: none;
+        }
+    </style>
+</head>
+<body>
+    <div id="loading">
+        <div class="spinner"></div>
+        <div class="loading-text">Đang tải dữ liệu...</div>
+    </div>
+
+    <div class="container">
+        <!-- LEFT SIDEBAR -->
+        <div class="sidebar">
+            <h2>⚙️ Cấu hình phân tích</h2>
+
+            <div class="form-group">
+                <label>Quốc gia</label>
+                <select id="country"></select>
+            </div>
+
+            <div class="form-group">
+                <label>Tỉnh / Thành phố</label>
+                <select id="province"></select>
+            </div>
+
+            <div class="form-group">
+                <label>Chỉ số vệ tinh</label>
+                <select id="index">
+                    <option value="NDVI">NDVI - Chỉ số thực vật</option>
+                    <option value="NDWI">NDWI - Chỉ số nước</option>
+                    <option value="EVI">EVI - Chỉ số thực vật cải tiến</option>
+                    <option value="NBR">NBR - Chỉ số phát hiện cháy</option>
+                    <option value="NDMI">NDMI - Chỉ số độ ẩm</option>
+                    <option value="SAVI">SAVI - Chỉ số đất-thực vật</option>
+                </select>
+            </div>
+
+            <div class="form-group">
+                <label>Năm</label>
+                <select id="year"></select>
+            </div>
+
+            <div class="form-group">
+                <label>Tháng</label>
+                <select id="month"></select>
+            </div>
+<div class="panel-section" style="margin-top: 16px;">
+    <h3>🛰️ Giám sát biến động</h3>
+
+    <div class="form-group">
+        <label>Kỳ gốc - Năm</label>
+        <select id="year1"></select>
+    </div>
+
+    <div class="form-group">
+        <label>Kỳ gốc - Tháng</label>
+        <select id="month1"></select>
+    </div>
+
+    <div class="form-group">
+        <label>Kỳ so sánh - Năm</label>
+        <select id="year2"></select>
+    </div>
+
+    <div class="form-group">
+        <label>Kỳ so sánh - Tháng</label>
+        <select id="month2"></select>
+    </div>
+</div>
+<div class="btn-container">
+    <button class="btn btn-primary" onclick="runAnalysis()">📊 Phân tích</button>
+   <button class="btn btn-primary" onclick="loadForecast()">🌿 AI NDVI/NDWI</button>
+</div>
+
+<div class="btn-container" style="margin-top: 10px;">
+    <button class="btn btn-primary" onclick="runChangeMonitor()">🛰️ Biến động</button>
+    <button class="btn btn-outline" onclick="toggleLayerVisibility()">👁️ Lớp</button>
+</div>
+
+<div class="btn-container" style="margin-top: 10px;">
+    <button class="btn btn-primary" onclick="toggleDashboard()">🗺️ Xem bản đồ</button>
+    <button class="btn btn-outline" onclick="resetMapView()">🎯 Zoom vùng</button>
+</div>
+
+            <div class="btn-container" style="margin-top: 10px;">
+                <button class="btn btn-outline" onclick="exportImage()">⬇️ Export</button>
+                <button class="btn btn-outline" onclick="searchImages()">🔍 Ảnh</button>
+            </div>
+
+            <hr style="margin: 20px 0; border-color: #334155;">
+
+            <div class="panel-section">
+                <h3>📍 Vị trí</h3>
+                <div id="layerControl" style="font-size: 12px;">Chọn khu vực để bắt đầu</div>
+            </div>
+
+            <div style="margin-top: 15px; padding: 12px; background: rgba(79, 70, 229, 0.1); border-radius: 8px; border-left: 3px solid #4f46e5;">
+                <p style="font-size: 12px; color: #94a3b8; margin: 0;">
+                    💡 Nhấp vào bản đồ để xem giá trị pixel tại vị trí đó.
+                </p>
+            </div>
+        </div>
+
+        <!-- ✅ MAP - Grid Column 2 -->
+        <!-- ✅ MAP - Grid Column 2 -->
+<div class="map-wrapper">
+    <div id="map" class="map"></div>
+
+    <button id="dashboardToggleBtn" class="map-toggle-btn" onclick="toggleDashboard()">
+        🗺️ Ẩn Dashboard / Xem Map
+    </button>
+</div>
+
+        <!-- RIGHT PANEL -->
+        <div class="right-panel">
+            <div class="panel-section">
+                <h3>📊 Thống kê</h3>
+                <div id="stats" style="font-size: 12px;">
+                    Chọn khu vực để xem thống kê
+                </div>
+            </div>
+
+            <div class="panel-section">
+                <h3>🎨 Legend</h3>
+                <div id="legend" style="font-size: 12px;">
+                    Chọn dữ liệu để xem legend
+                </div>
+            </div>
+
+            <div class="panel-section">
+                <h3>📷 Danh sách ảnh</h3>
+                <select id="imageList" style="width: 100%; font-size: 12px;">
+                    <option>-- Không có ảnh --</option>
+                </select>
+            </div>
+        </div>
+    </div>
+
+    <!-- ✅ MAIN CONTENT - Absolute Position (not fixed) -->
+    <div class="main-content">
+        <div class="tabs">
+            <button class="tab-btn active" onclick="switchTab('analysis')">📈 Phân tích</button>
+            <button class="tab-btn" onclick="switchTab('forecast')">🌿 AI dự báo NDVI/NDWI</button>
+            <button class="tab-btn" onclick="switchTab('change')">🛰️ NDVI/NDWI Change</button>
+        </div>
+
+        <!-- ANALYSIS TAB -->
+        <div id="analysis" class="tab-content active">
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 15px; margin-bottom: 20px;">
+                <div class="chart-container">
+                    <canvas id="barChart"></canvas>
+                </div>
+
+                <div class="chart-container">
+                    <canvas id="lineChart"></canvas>
+                </div>
+            </div>
+
+            <div class="chart-container">
+                <canvas id="scatterChart"></canvas>
+            </div>
+
+            <div id="analysisTable" style="margin-top: 20px;">
+                <!-- Analysis results here -->
+            </div>
+        </div>
+
+        <!-- FORECAST TAB -->
+        <div id="forecast" class="tab-content">
+            <div id="forecastMeta" class="source-box">
+                Nguồn dự báo sẽ hiển thị tại đây.
+            </div>
+
+            <div class="chart-container">
+                <canvas id="forecastChart"></canvas>
+            </div>
+
+            <div class="chart-container">
+                <canvas id="precipChart"></canvas>
+            </div>
+
+            <div class="chart-container">
+                <canvas id="humidityChart"></canvas>
+            </div>
+
+            <div id="forecastTable" style="margin-top: 20px;">
+                <!-- Forecast results here -->
+            </div>
+        </div>
+
+        <!-- CHANGE MONITOR TAB -->
+        <div id="change" class="tab-content">
+            <div class="chart-container">
+                <canvas id="changeChart"></canvas>
+            </div>
+
+            <div id="changeSummary" class="ai-insight-container">
+                Chọn 2 kỳ thời gian rồi bấm “Biến động”.
+            </div>
+        </div>
+    </div>
+
+    <!-- ✅ OpenLayers Library -->
+    <script src="https://cdn.jsdelivr.net/npm/ol@10.0.0/dist/ol.js"></script>
+
+    <!-- ✅ Map Script -->
+    <script src="{{ url_for('static', filename='map.js') }}"></script>
+
+    <script>
+        function switchTab(tabName) {
+            document.querySelectorAll('.tab-content').forEach(el => {
+                el.classList.remove('active');
+            });
+
+            document.querySelectorAll('.tab-btn').forEach(el => {
+                el.classList.remove('active');
+            });
+
+            const tab = document.getElementById(tabName);
+            if (tab) {
+                tab.classList.add('active');
+            }
+
+            document.querySelectorAll('.tab-btn').forEach(btn => {
+                const onclick = btn.getAttribute('onclick') || "";
+                if (onclick.includes("'" + tabName + "'") || onclick.includes('"' + tabName + '"')) {
+                    btn.classList.add('active');
+                }
+            });
+        }
+
+        window.addEventListener('load', function() {
+            console.log("✅ Page loaded");
+            console.log("✅ OpenLayers:", typeof ol !== 'undefined' ? "OK" : "MISSING");
+            console.log("✅ Map element:", document.getElementById('map') ? "OK" : "MISSING");
+
+            if (typeof map !== 'undefined') {
+                console.log("✅ Map object initialized");
+                console.log("✅ Map size:", map.getSize());
+            } else {
+                console.error("❌ Map object NOT initialized");
+            }
+        });
+    </script>
+</body>
+</html>
