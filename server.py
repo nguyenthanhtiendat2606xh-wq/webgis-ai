@@ -76,8 +76,16 @@ service_account = os.getenv(
     "GEE_SERVICE_ACCOUNT",
     "tiendat123-65@centered-inn-471103-g0.iam.gserviceaccount.com"
 )
+import tempfile
 
-private_key_path = os.getenv("GEE_PRIVATE_KEY_PATH", "private-key.json")
+private_key_json = os.getenv("GEE_PRIVATE_KEY_JSON")
+
+if private_key_json:
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+        f.write(private_key_json)
+        private_key_path = f.name
+else:
+    private_key_path = os.getenv("GEE_PRIVATE_KEY_PATH", "private-key.json")
 
 credentials = ee.ServiceAccountCredentials(
     service_account,
