@@ -7,3 +7,4 @@ data/
 *.tif
 *.zip
 node_modules/
+private-key.json
